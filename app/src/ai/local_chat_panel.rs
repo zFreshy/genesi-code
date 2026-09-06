@@ -442,6 +442,10 @@ struct MempalaceState {
     active_chat_id: String,
     #[serde(default)]
     chats: Vec<PersistedLocalChat>,
+    /// The working mode, so a deliberate choice survives a restart. `None` is a
+    /// profile written before this existed, which falls back to the default.
+    #[serde(default)]
+    chat_mode: Option<ChatMode>,
 }
 
 /// Count lines for a diff stat: 0 for empty, else the number of lines (a
@@ -526,7 +530,7 @@ pub struct LocalChatSummary {
 /// How the assistant is allowed to work. One selector replaces what used to be
 /// two independent chips (Agent on/off and AUTO on/off), which could express the
 /// same three useful states plus a meaningless fourth (AUTO while not an agent).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChatMode {
     /// Answers questions only; no tools, nothing touched.
     Chat,
@@ -904,7 +908,13 @@ impl LocalAiChatView {
             current_turn: 0,
             attach_context: true,
             attachments: Vec::new(),
-            agent_mode: true,
+            // Chat, not Build. Build runs an agent loop, and a loop is many
+            // requests for one prompt -- up to MAX_AGENT_STEPS of them. That is
+            // the right shape when you asked for work to be done, and the wrong
+            // one to charge someone's metered API key for by default, when the
+            // prompt was a question. Build stays one click away, and the choice
+            // is remembered once made.
+            agent_mode: false,
             agent_root: None,
             agent_messages: Vec::new(),
             agent_model: String::new(),
@@ -8859,6 +8869,9 @@ impl TypedActionView for LocalAiChatView {
             LocalAiChatAction::SetChatMode(mode) => {
                 self.set_chat_mode(*mode);
                 self.mode_picker_open = false;
+                // Remember it: resetting to the default on every launch is how
+                // someone ends up back in an agent loop they had opted out of.
+                self.persist_mempalace(ctx, false);
                 ctx.notify();
             }
             LocalAiChatAction::SetPickerTab(tab) => {
@@ -9144,6 +9157,7 @@ impl LocalAiChatView {
         let state = MempalaceState {
             active_chat_id: self.active_chat_id.clone(),
             chats: self.chats.clone(),
+            chat_mode: Some(self.chat_mode()),
         };
         match serde_json::to_string(&state) {
             Ok(json) => {
@@ -9187,6 +9201,9 @@ impl LocalAiChatView {
                 Ok(state) => {
                     self.active_chat_id = state.active_chat_id;
                     self.chats = state.chats;
+                    if let Some(mode) = state.chat_mode {
+                        self.set_chat_mode(mode);
+                    }
                     self.prune_chats();
                     if self.active_chat_id.is_empty() {
                         self.active_chat_id = self
