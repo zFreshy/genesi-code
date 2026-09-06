@@ -312,7 +312,13 @@ pub fn is_image_path(path: &std::path::Path) -> bool {
 }
 
 fn mime_type_for(name: &str) -> &'static str {
-    match name.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+    match name
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
         "webp" => "image/webp",
@@ -333,15 +339,34 @@ pub fn model_supports_vision(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
     const VISION_MARKERS: &[&str] = &[
         // Local vision stacks.
-        "llava", "bakllava", "moondream", "minicpm-v", "llama3.2-vision", "llama-3.2-vision",
-        "pixtral", "internvl", "cogvlm", "glm-4v", "-vl", "_vl", "vl-", "vision", "gemma-3",
-        "gemma3", "mistral-small-3", "granite-vision",
+        "llava",
+        "bakllava",
+        "moondream",
+        "minicpm-v",
+        "llama3.2-vision",
+        "llama-3.2-vision",
+        "pixtral",
+        "internvl",
+        "cogvlm",
+        "glm-4v",
+        "-vl",
+        "_vl",
+        "vl-",
+        "vision",
+        "gemma-3",
+        "gemma3",
+        "mistral-small-3",
+        "granite-vision",
         // Cloud families that are multimodal across the board.
-        "gpt-4o", "gpt-4.1", "gpt-5", "o3", "o4-mini", "claude", "gemini",
+        "gpt-4o",
+        "gpt-4.1",
+        "gpt-5",
+        "o3",
+        "o4-mini",
+        "claude",
+        "gemini",
     ];
-    VISION_MARKERS
-        .iter()
-        .any(|marker| model.contains(marker))
+    VISION_MARKERS.iter().any(|marker| model.contains(marker))
 }
 
 /// Truncate context text to the line/char caps, marking it when cut.
@@ -638,10 +663,15 @@ pub fn stream_chat(
         // ollama's native API takes tools in its own shape and its support varies
         // per model; the text protocol is what works there, so leave it alone.
         LocalEndpoint::Ollama => stream_chat_ollama_native(model.to_string(), messages).boxed(),
-        LocalEndpoint::Turbo => {
-            stream_chat_openai_sse(endpoint.base_url(), None, messages, None, tools, reply_tokens)
-                .boxed()
-        }
+        LocalEndpoint::Turbo => stream_chat_openai_sse(
+            endpoint.base_url(),
+            None,
+            messages,
+            None,
+            tools,
+            reply_tokens,
+        )
+        .boxed(),
     }
 }
 
@@ -680,9 +710,9 @@ pub fn stream_chat_cloud(
     }
 }
 
-/// How many times a rate-limited turn is retried before the error reaches the
-/// user. Two rides out a per-minute window without leaving anyone staring at a
-/// panel that looks frozen.
+/// How many times a refused turn is retried before the error reaches the user.
+/// Two rides out a per-minute window, or a provider's brief capacity dip,
+/// without leaving anyone staring at a panel that looks frozen.
 const RATE_LIMIT_MAX_RETRIES: u32 = 2;
 
 /// Longest pause we'll honour before deciding the user would rather see the
@@ -692,20 +722,30 @@ const RATE_LIMIT_MAX_WAIT: Duration = Duration::from_secs(45);
 /// What to wait when a provider says "slow down" without saying for how long.
 const RATE_LIMIT_FALLBACK_WAIT: Duration = Duration::from_secs(10);
 
-/// Retry a chat stream through a provider's rate limit.
+/// What to wait after a transient server error. Shorter than the rate-limit
+/// fallback: nothing is metered here, the far side is just briefly unwell, and
+/// doubling each attempt covers a longer dip without a long first stall.
+const SERVER_ERROR_FIRST_WAIT: Duration = Duration::from_secs(2);
+
+/// Retry a chat stream the provider refused for a reason that will pass.
 ///
-/// Every BYOK provider meters requests, and the free tiers meter them tightly:
-/// Groq's is 8k tokens per MINUTE, which one agent step can spend on its own.
-/// Without this the turn just died — the panel showed a red "429 Too Many
-/// Requests … try again in 22.6s" and the build stopped there, even though the
-/// provider had told us exactly how long to wait.
+/// Two things refuse a turn that would have worked a moment later. Every BYOK
+/// provider meters requests, and the free tiers meter them tightly: Groq's is
+/// 8k tokens per MINUTE, which one agent step can spend on its own. And the
+/// same free tiers shed load under bursts — a 503 while a model is cold, or a
+/// 502 from a gateway mid-rollout. An agent turn issues its steps back to back,
+/// which is exactly the shape that trips both.
+///
+/// Only the rate limit was handled before, so a 503 killed the turn outright:
+/// the panel streamed a few seconds of a first step and then went red, which is
+/// what "it works for a few seconds and then errors" was.
 ///
 /// `build` is called once per attempt, so it must own everything it needs. It
 /// hands back an already-boxed stream on purpose: making this generic over the
 /// stream type monomorphised one `async_stream` generator per provider path,
 /// each wrapping the last, and rustc blew its stack compiling the result.
 ///
-/// Only a rate limit that lands BEFORE any output is retried: once tokens have
+/// Only a refusal that lands BEFORE any output is retried: once tokens have
 /// been streamed into the UI, replaying the request would duplicate them.
 fn retrying_on_rate_limit(
     build: Box<dyn Fn() -> futures::stream::BoxStream<'static, Result<ChatStreamItem>> + Send>,
@@ -718,7 +758,7 @@ fn retrying_on_rate_limit(
             while let Some(item) = inner.next().await {
                 if !streamed_anything && attempt < RATE_LIMIT_MAX_RETRIES {
                     if let Some(wait) = item.as_ref().err().and_then(|err| {
-                        rate_limit_wait(&err.to_string())
+                        retry_wait(&err.to_string(), attempt)
                     }) {
                         retry_after = Some(wait);
                         break;
@@ -729,7 +769,7 @@ fn retrying_on_rate_limit(
             }
             let Some(wait) = retry_after else { return };
             log::info!(
-                "local chat: provider rate-limited the request, retrying in {:.1}s",
+                "local chat: provider refused the request, retrying in {:.1}s",
                 wait.as_secs_f64()
             );
             warpui::r#async::Timer::after(wait).await;
@@ -738,25 +778,43 @@ fn retrying_on_rate_limit(
     .boxed()
 }
 
-/// How long to wait after a rate limit, read out of the provider's own message.
+/// How long to wait before retrying, or `None` when the error will not pass.
 ///
-/// The OpenAI-compatible providers answer a 429 with the exact wait that makes
-/// the retry work ("Please try again in 22.627499999s"), so honour it rather
-/// than guessing. Returns `None` for anything that isn't a rate limit — that is
-/// what stops a bad key or a missing model from being retried three times.
-fn rate_limit_wait(error: &str) -> Option<Duration> {
+/// Returning `None` is what stops a bad key, a missing model, or a prompt that
+/// overflows the window from being sent three times.
+fn retry_wait(error: &str, attempt: u32) -> Option<Duration> {
     let error = error.to_ascii_lowercase();
-    if !(error.contains("429")
-        || error.contains("too many requests")
-        || error.contains("rate limit"))
+
+    // A rate limit states its own wait ("Please try again in 22.627499999s"),
+    // and honouring it is the difference between the retry working and it
+    // being refused again.
+    if error.contains("429") || error.contains("too many requests") || error.contains("rate limit")
     {
+        let wait = error
+            .split("try again in")
+            .nth(1)
+            .and_then(parse_leading_duration)
+            .unwrap_or(RATE_LIMIT_FALLBACK_WAIT);
+        return Some(wait.min(RATE_LIMIT_MAX_WAIT));
+    }
+
+    // Transient server-side failures. 500 is deliberately absent: providers
+    // return it for malformed requests too, and retrying one of those just
+    // spends the user's quota three times to reach the same error.
+    let transient = ["502", "503", "504"]
+        .iter()
+        .any(|code| error.contains(code))
+        || error.contains("service unavailable")
+        || error.contains("bad gateway")
+        || error.contains("gateway timeout")
+        || error.contains("overloaded")
+        || error.contains("temporarily unavailable")
+        || error.contains("currently loading");
+    if !transient {
         return None;
     }
-    let wait = error
-        .split("try again in")
-        .nth(1)
-        .and_then(parse_leading_duration)
-        .unwrap_or(RATE_LIMIT_FALLBACK_WAIT);
+
+    let wait = SERVER_ERROR_FIRST_WAIT * 2u32.pow(attempt);
     Some(wait.min(RATE_LIMIT_MAX_WAIT))
 }
 
@@ -948,10 +1006,8 @@ fn stream_chat_openai_sse(
                             if let Some(content) = choice.delta.content {
                                 answer.push_str(&content);
                             }
-                            if let Some(reasoning) = choice
-                                .delta
-                                .reasoning_content
-                                .or(choice.delta.reasoning)
+                            if let Some(reasoning) =
+                                choice.delta.reasoning_content.or(choice.delta.reasoning)
                             {
                                 thinking.push_str(&reasoning);
                             }

@@ -10,7 +10,10 @@ use super::*;
 fn gguf_references_are_recognised() {
     assert!(is_gguf_ref("gguf:qwen3-30b-a3b-q4_k_m"));
     assert!(is_gguf_ref("/home/u/models/mistral.gguf"));
-    assert!(is_gguf_ref("MODEL.GGUF"), "the suffix check is case-insensitive");
+    assert!(
+        is_gguf_ref("MODEL.GGUF"),
+        "the suffix check is case-insensitive"
+    );
 }
 
 #[test]
@@ -226,7 +229,10 @@ fn a_reply_never_gets_the_whole_window() {
     // Asking for 4096 reply tokens on a 4096 window leaves the prompt nowhere to
     // go — the 400 the server returned on hardware.
     let budget = reply_budget(4096, 3800);
-    assert!(budget <= 296, "reply must fit what the prompt left: {budget}");
+    assert!(
+        budget <= 296,
+        "reply must fit what the prompt left: {budget}"
+    );
     assert!(budget >= 256, "but never collapse to nothing: {budget}");
 }
 
@@ -259,7 +265,7 @@ fn a_rate_limit_is_retried_after_the_wait_the_provider_asked_for() {
     let err = "the model server returned 429 Too Many Requests: Rate limit reached \
                for model `openai/gpt-oss-120b` ... Please try again in 22.627499999s.";
     assert_eq!(
-        rate_limit_wait(err),
+        retry_wait(err, 0),
         Some(Duration::from_secs_f64(22.627499999))
     );
 }
@@ -267,7 +273,7 @@ fn a_rate_limit_is_retried_after_the_wait_the_provider_asked_for() {
 #[test]
 fn a_rate_limit_without_a_stated_wait_still_backs_off() {
     assert_eq!(
-        rate_limit_wait("the model server returned 429 Too Many Requests"),
+        retry_wait("the model server returned 429 Too Many Requests", 0),
         Some(RATE_LIMIT_FALLBACK_WAIT)
     );
 }
@@ -276,7 +282,7 @@ fn a_rate_limit_without_a_stated_wait_still_backs_off() {
 fn an_absurd_wait_is_capped_rather_than_honoured() {
     // A provider asking for ten minutes is worse for the user than the error.
     assert_eq!(
-        rate_limit_wait("429 rate limit, please try again in 600s"),
+        retry_wait("429 rate limit, please try again in 600s", 0),
         Some(RATE_LIMIT_MAX_WAIT)
     );
 }
@@ -284,16 +290,67 @@ fn an_absurd_wait_is_capped_rather_than_honoured() {
 #[test]
 fn ordinary_failures_are_never_retried() {
     // Retrying a bad key or a missing model just delays the error three times.
-    assert_eq!(rate_limit_wait("the model server returned 401 Unauthorized"), None);
-    assert_eq!(rate_limit_wait("the model server returned 404: model not found"), None);
-    assert_eq!(rate_limit_wait("connection refused"), None);
+    assert_eq!(
+        retry_wait("the model server returned 401 Unauthorized", 0),
+        None
+    );
+    assert_eq!(
+        retry_wait("the model server returned 404: model not found", 0),
+        None
+    );
+    assert_eq!(retry_wait("connection refused", 0), None);
 }
 
 #[test]
 fn wait_units_are_read_not_assumed() {
     // "ms" must be checked before "m", or a 500ms backoff becomes 500 minutes.
-    assert_eq!(parse_leading_duration("500ms"), Some(Duration::from_millis(500)));
+    assert_eq!(
+        parse_leading_duration("500ms"),
+        Some(Duration::from_millis(500))
+    );
     assert_eq!(parse_leading_duration("2m"), Some(Duration::from_secs(120)));
     assert_eq!(parse_leading_duration("30s"), Some(Duration::from_secs(30)));
     assert_eq!(parse_leading_duration("nope"), None);
+}
+
+#[test]
+fn a_transient_server_error_is_retried() {
+    // The failure behind "it works for a few seconds and then errors": an agent
+    // turn issues its steps back to back, a free tier sheds one of them, and
+    // before this the turn died there.
+    assert_eq!(
+        retry_wait("the model server returned 503 Service Unavailable", 0),
+        Some(SERVER_ERROR_FIRST_WAIT)
+    );
+    assert_eq!(
+        retry_wait("the model server returned 502 Bad Gateway", 0),
+        Some(SERVER_ERROR_FIRST_WAIT)
+    );
+    assert_eq!(
+        retry_wait(
+            "the model server did not return a stream: Model is currently loading",
+            0
+        ),
+        Some(SERVER_ERROR_FIRST_WAIT)
+    );
+}
+
+#[test]
+fn a_repeated_server_error_backs_off_further() {
+    // A provider still shedding load on the second attempt gets longer to
+    // recover, rather than the same impatient retry.
+    assert_eq!(
+        retry_wait("the model server returned 503 Service Unavailable", 1),
+        Some(SERVER_ERROR_FIRST_WAIT * 2)
+    );
+}
+
+#[test]
+fn a_server_error_that_means_a_bad_request_is_not_retried() {
+    // 500 is what several providers return for a malformed request. Retrying
+    // one of those spends the user's quota three times to reach the same error.
+    assert_eq!(
+        retry_wait("the model server returned 500 Internal Server Error", 0),
+        None
+    );
 }
