@@ -55,7 +55,7 @@ use super::local_chat::{
     stream_chat_cloud, transport_for, turbo_context_size, turbo_health_ok, AiModeState,
     AttachmentKind, ChatAttachment, ChatMessage, ChatStreamItem, CloudConfig, CloudKeyStore,
     CloudProviderKind, CodeContext, LocalEndpoint, ASSUMED_CONTEXT_TOKENS, CLOUD_KEYS_STORAGE_KEY,
-    DEFAULT_LOCAL_BASE_URL, LOCAL_MAX_TOKENS,
+    DEFAULT_LOCAL_BASE_URL,
 };
 use super::project_canvas::{
     analyze_project, CanvasEdgeKind, CanvasNode, CanvasNodeKind, ProjectCanvasGraph, ProjectKind,
@@ -1095,11 +1095,8 @@ impl LocalAiChatView {
             .map(|message| estimate_tokens(&message.content))
             .sum::<usize>()
             + tool_tokens;
-        let reply_tokens = if self.cloud_active {
-            LOCAL_MAX_TOKENS
-        } else {
-            reply_budget(self.effective_context(), prompt_tokens)
-        };
+        // Only the local server needs a reply cap; the cloud path sends none.
+        let reply_tokens = reply_budget(self.effective_context(), prompt_tokens);
         if self.cloud_active && self.cloud_ready() {
             stream_chat_cloud(
                 self.cloud.provider,
@@ -1107,7 +1104,6 @@ impl LocalAiChatView {
                 self.active_cloud_key().to_string(),
                 messages,
                 tools,
-                reply_tokens,
             )
         } else {
             // The transport is decided by the MODEL, not by `self.endpoint`

@@ -11,6 +11,8 @@
 #![allow(dead_code)]
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -439,7 +441,15 @@ struct ChatRequest<'a> {
     stream: bool,
     /// Without a cap llama-server can run to the end of the context window; the
     /// Monitor sends one and Code did not.
-    max_tokens: u32,
+    ///
+    /// `None` for a cloud provider. The cap is sized for a local window, and on
+    /// a model that thinks before it answers the reasoning tokens are billed
+    /// against it: Gemini 3.5 Flash spent the whole 4096 thinking and closed the
+    /// stream with `finish_reason: length` and an empty `content`, which
+    /// surfaced as "the provider closed the stream without sending any text".
+    /// The provider's own default is the right ceiling for its own model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
     /// Reuse the KV prefix across turns — the system prompt and file context are
     /// resent every turn, so this is a large time-to-first-token win locally.
     /// Ignored by cloud providers that don't know the field.
@@ -545,6 +555,10 @@ struct ChatChunk {
 struct ChatChoice {
     #[serde(default)]
     delta: ChatDelta,
+    /// Why the model stopped. Read only to explain a stream that produced
+    /// nothing -- see [`empty_stream_reason`].
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -669,7 +683,7 @@ pub fn stream_chat(
             messages,
             None,
             tools,
-            reply_tokens,
+            Some(reply_tokens),
         )
         .boxed(),
     }
@@ -686,7 +700,6 @@ pub fn stream_chat_cloud(
     api_key: String,
     messages: Vec<ChatMessage>,
     tools: Option<serde_json::Value>,
-    reply_tokens: u32,
 ) -> futures::stream::BoxStream<'static, Result<ChatStreamItem>> {
     let model = model.to_string();
     match provider {
@@ -702,7 +715,9 @@ pub fn stream_chat_cloud(
                     messages.clone(),
                     Some(api_key.clone()),
                     tools.clone(),
-                    reply_tokens,
+                    // No cap: see ChatRequest::max_tokens. The provider knows
+                    // its own model's ceiling; ours was sized for a local one.
+                    None,
                 )
                 .boxed()
             }))
@@ -790,6 +805,17 @@ fn retry_wait(error: &str, attempt: u32) -> Option<Duration> {
     // being refused again.
     if error.contains("429") || error.contains("too many requests") || error.contains("rate limit")
     {
+        // Except a DAILY cap, which no amount of waiting clears inside a
+        // session. Gemini's free tier is 20 requests per day, and one agent
+        // turn spends several of them; retrying three times just spends three
+        // more to reach the same wall. Let the provider's own message through.
+        if error.contains("per day")
+            || error.contains("perday")
+            || error.contains("daily")
+            || error.contains("requests per day")
+        {
+            return None;
+        }
         let wait = error
             .split("try again in")
             .nth(1)
@@ -948,7 +974,7 @@ fn stream_chat_openai_sse(
     messages: Vec<ChatMessage>,
     api_key: Option<String>,
     tools: Option<serde_json::Value>,
-    reply_tokens: u32,
+    reply_tokens: Option<u32>,
 ) -> impl Stream<Item = Result<ChatStreamItem>> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     // `model: None` means the local llama-server, which must NOT be sent one (see
@@ -982,110 +1008,157 @@ fn stream_chat_openai_sse(
         request = request.bearer_auth(key.trim());
     }
     let event_source = request.json(&body).eventsource();
+    // Whether this stream has produced anything at all. A `finish_reason` that
+    // ends an EMPTY stream is the difference between a mystery and a message;
+    // the same reason after real output just means the answer was cut short,
+    // and turning that into an error would bury the answer.
+    let saw_output = Arc::new(AtomicBool::new(false));
 
-    event_source.filter_map(|event| async move {
-        match event {
-            Ok(Event::Open) => None,
-            Ok(Event::Message(message)) => {
-                let data = message.data.trim();
-                // OpenAI-style terminator. ollama/llama-server both send this.
-                if data == "[DONE]" {
-                    return Some(Ok(ChatStreamItem::Done));
-                }
-                match serde_json::from_str::<ChatChunk>(data) {
-                    Ok(chunk) => {
-                        // The answer, the thinking and a native tool call are
-                        // reported separately, so a thinking model shows progress
-                        // without its reasoning being mistaken for the answer, and
-                        // a tool call it made on its own channel is not lost.
-                        let mut answer = String::new();
-                        let mut thinking = String::new();
-                        let mut tool_name: Option<String> = None;
-                        let mut tool_args = String::new();
-                        for choice in chunk.choices {
-                            if let Some(content) = choice.delta.content {
-                                answer.push_str(&content);
+    event_source.filter_map(move |event| {
+        let saw_output = saw_output.clone();
+        async move {
+            match event {
+                Ok(Event::Open) => None,
+                Ok(Event::Message(message)) => {
+                    let data = message.data.trim();
+                    // OpenAI-style terminator. ollama/llama-server both send this.
+                    if data == "[DONE]" {
+                        return Some(Ok(ChatStreamItem::Done));
+                    }
+                    match serde_json::from_str::<ChatChunk>(data) {
+                        Ok(chunk) => {
+                            // The answer, the thinking and a native tool call are
+                            // reported separately, so a thinking model shows progress
+                            // without its reasoning being mistaken for the answer, and
+                            // a tool call it made on its own channel is not lost.
+                            let mut answer = String::new();
+                            let mut thinking = String::new();
+                            let mut tool_name: Option<String> = None;
+                            let mut tool_args = String::new();
+                            let mut finish_reason: Option<String> = None;
+                            for choice in chunk.choices {
+                                if let Some(reason) = choice.finish_reason {
+                                    finish_reason = Some(reason);
+                                }
+                                if let Some(content) = choice.delta.content {
+                                    answer.push_str(&content);
+                                }
+                                if let Some(reasoning) =
+                                    choice.delta.reasoning_content.or(choice.delta.reasoning)
+                                {
+                                    thinking.push_str(&reasoning);
+                                }
+                                for call in choice.delta.tool_calls.into_iter().flatten() {
+                                    let Some(function) = call.function else {
+                                        continue;
+                                    };
+                                    if let Some(name) = function.name.filter(|n| !n.is_empty()) {
+                                        tool_name = Some(name);
+                                    }
+                                    if let Some(arguments) = function.arguments {
+                                        tool_args.push_str(&arguments);
+                                    }
+                                }
                             }
-                            if let Some(reasoning) =
-                                choice.delta.reasoning_content.or(choice.delta.reasoning)
+                            // A chunk carries exactly one of these in practice, so the
+                            // order below only decides an impossible tie. Answer text
+                            // wins because it is what the user reads.
+                            if !answer.is_empty() {
+                                saw_output.store(true, Ordering::Relaxed);
+                                Some(Ok(ChatStreamItem::Token(answer)))
+                            } else if tool_name.is_some() || !tool_args.is_empty() {
+                                saw_output.store(true, Ordering::Relaxed);
+                                Some(Ok(ChatStreamItem::ToolCall {
+                                    name: tool_name,
+                                    arguments: tool_args,
+                                }))
+                            } else if !thinking.is_empty() {
+                                saw_output.store(true, Ordering::Relaxed);
+                                Some(Ok(ChatStreamItem::Reasoning(thinking)))
+                            } else if let Some(reason) = finish_reason
+                                .filter(|_| !saw_output.load(Ordering::Relaxed))
+                                .and_then(|reason| empty_stream_reason(&reason))
                             {
-                                thinking.push_str(&reasoning);
-                            }
-                            for call in choice.delta.tool_calls.into_iter().flatten() {
-                                let Some(function) = call.function else {
-                                    continue;
-                                };
-                                if let Some(name) = function.name.filter(|n| !n.is_empty()) {
-                                    tool_name = Some(name);
-                                }
-                                if let Some(arguments) = function.arguments {
-                                    tool_args.push_str(&arguments);
-                                }
+                                // The model stopped before writing anything, and said
+                                // why. Saying it back beats the caller's generic "the
+                                // provider closed the stream without sending any
+                                // text", which describes the symptom and names no
+                                // cause the user could act on.
+                                Some(Err(anyhow!("{reason}")))
+                            } else {
+                                None
                             }
                         }
-                        // A chunk carries exactly one of these in practice, so the
-                        // order below only decides an impossible tie. Answer text
-                        // wins because it is what the user reads.
-                        if !answer.is_empty() {
-                            Some(Ok(ChatStreamItem::Token(answer)))
-                        } else if tool_name.is_some() || !tool_args.is_empty() {
-                            Some(Ok(ChatStreamItem::ToolCall {
-                                name: tool_name,
-                                arguments: tool_args,
-                            }))
-                        } else if !thinking.is_empty() {
-                            Some(Ok(ChatStreamItem::Reasoning(thinking)))
-                        } else {
+                        Err(err) => {
+                            log::warn!("local chat: skipping malformed chunk: {err}");
                             None
                         }
                     }
-                    Err(err) => {
-                        log::warn!("local chat: skipping malformed chunk: {err}");
-                        None
+                }
+                // A normal end of stream, NOT a failure. The event source yields this
+                // once the server closes the connection, which happens right after
+                // `[DONE]` — reporting it put an error banner under every successful
+                // answer. Ending quietly is correct; a genuinely empty response is
+                // caught by the caller, which knows whether any token arrived.
+                Err(EventSourceError::StreamEnded) => None,
+                // The server refused the request or answered with something that
+                // isn't an event stream (llama-server does this for a prompt that
+                // exceeds the context window, for example). Both variants carry the
+                // response, so read the body and show what it actually said instead
+                // of a bare "Invalid status code: 400".
+                Err(EventSourceError::InvalidStatusCode(status, response)) => {
+                    let body = response.text().await.unwrap_or_default();
+                    Some(Err(anyhow!(
+                        "the model server returned {status}{}",
+                        format_server_detail(&body)
+                    )))
+                }
+                Err(EventSourceError::InvalidContentType(_, response)) => {
+                    let body = response.text().await.unwrap_or_default();
+                    Some(Err(anyhow!(
+                        "the model server did not return a stream{}",
+                        format_server_detail(&body)
+                    )))
+                }
+                Err(err) => {
+                    // reqwest's Display hides the underlying cause (e.g. "connection
+                    // refused" / "connection reset"), so walk the source chain and
+                    // append it — otherwise every failure reads the same useless
+                    // "error sending request for url".
+                    use std::error::Error as _;
+                    let mut detail = String::new();
+                    let mut source = err.source();
+                    while let Some(cause) = source {
+                        detail.push_str(&format!(": {cause}"));
+                        source = cause.source();
                     }
+                    Some(Err(anyhow!("local chat stream error: {err}{detail}")))
                 }
-            }
-            // A normal end of stream, NOT a failure. The event source yields this
-            // once the server closes the connection, which happens right after
-            // `[DONE]` — reporting it put an error banner under every successful
-            // answer. Ending quietly is correct; a genuinely empty response is
-            // caught by the caller, which knows whether any token arrived.
-            Err(EventSourceError::StreamEnded) => None,
-            // The server refused the request or answered with something that
-            // isn't an event stream (llama-server does this for a prompt that
-            // exceeds the context window, for example). Both variants carry the
-            // response, so read the body and show what it actually said instead
-            // of a bare "Invalid status code: 400".
-            Err(EventSourceError::InvalidStatusCode(status, response)) => {
-                let body = response.text().await.unwrap_or_default();
-                Some(Err(anyhow!(
-                    "the model server returned {status}{}",
-                    format_server_detail(&body)
-                )))
-            }
-            Err(EventSourceError::InvalidContentType(_, response)) => {
-                let body = response.text().await.unwrap_or_default();
-                Some(Err(anyhow!(
-                    "the model server did not return a stream{}",
-                    format_server_detail(&body)
-                )))
-            }
-            Err(err) => {
-                // reqwest's Display hides the underlying cause (e.g. "connection
-                // refused" / "connection reset"), so walk the source chain and
-                // append it — otherwise every failure reads the same useless
-                // "error sending request for url".
-                use std::error::Error as _;
-                let mut detail = String::new();
-                let mut source = err.source();
-                while let Some(cause) = source {
-                    detail.push_str(&format!(": {cause}"));
-                    source = cause.source();
-                }
-                Some(Err(anyhow!("local chat stream error: {err}{detail}")))
             }
         }
     })
+}
+
+/// Turn a `finish_reason` that ended an empty stream into something the user can
+/// act on, or `None` when it carries no useful cause.
+///
+/// A normal `stop` or `tool_calls` on an empty stream says nothing; the rest
+/// name a specific wall the model hit, and each has a different fix.
+fn empty_stream_reason(reason: &str) -> Option<String> {
+    match reason.to_ascii_lowercase().as_str() {
+        "length" | "max_tokens" => Some(
+            "the model used its entire output budget before writing an answer.              Models that think before answering spend that budget on reasoning              first — try a shorter conversation, or a model that does not think."
+                .to_string(),
+        ),
+        "content_filter" | "safety" => Some(
+            "the provider's safety filter blocked the response.".to_string(),
+        ),
+        "recitation" => Some(
+            "the provider stopped the response because it reproduced training              data verbatim."
+                .to_string(),
+        ),
+        _ => None,
+    }
 }
 
 /// Pull the human-readable part out of an error body. llama-server and the

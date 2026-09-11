@@ -354,3 +354,49 @@ fn a_server_error_that_means_a_bad_request_is_not_retried() {
         None
     );
 }
+
+#[test]
+fn a_daily_quota_is_not_retried() {
+    // Gemini's free tier is 20 requests per day and one agent turn spends
+    // several. No wait inside a session clears that, so retrying three times
+    // just spends three more requests to reach the same wall.
+    assert_eq!(
+        retry_wait(
+            "the model server returned 429: Quota exceeded for quota metric \
+             'Generate requests per day' ... please try again in 30s",
+            0
+        ),
+        None
+    );
+}
+
+#[test]
+fn a_per_minute_limit_is_still_retried() {
+    // The per-minute window is the one that does clear on its own.
+    assert_eq!(
+        retry_wait(
+            "429 Too Many Requests: rate limit reached, please try again in 12s",
+            0
+        ),
+        Some(Duration::from_secs(12))
+    );
+}
+
+#[test]
+fn an_empty_stream_explains_the_wall_the_model_hit() {
+    // The failure behind "the provider closed the stream without sending any
+    // text": a model that thinks before answering can spend its whole output
+    // budget reasoning and finish with empty content.
+    assert!(empty_stream_reason("length").is_some_and(|reason| reason.contains("output budget")));
+    assert!(empty_stream_reason("MAX_TOKENS").is_some());
+    assert!(empty_stream_reason("content_filter")
+        .is_some_and(|reason| reason.contains("safety filter")));
+}
+
+#[test]
+fn an_ordinary_stop_explains_nothing() {
+    // A clean stop on an empty stream has no cause to report; inventing one
+    // would be worse than the caller's own message.
+    assert_eq!(empty_stream_reason("stop"), None);
+    assert_eq!(empty_stream_reason("tool_calls"), None);
+}
